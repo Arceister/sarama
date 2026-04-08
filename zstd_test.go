@@ -7,6 +7,21 @@ import (
 	"testing"
 )
 
+func BenchmarkZstdCompressAllocs(b *testing.B) {
+	params := ZstdEncoderParams{Level: CompressionLevelDefault}
+	// Typical Kafka message payload: 2KB
+	payload := make([]byte, 2048)
+	for i := range payload {
+		payload[i] = byte(i % 251)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		_, _ = zstdCompress(params, nil, payload)
+	}
+}
+
 func BenchmarkZstdMemoryConsumption(b *testing.B) {
 	params := ZstdEncoderParams{Level: 9}
 	buf := make([]byte, 1024*1024)
