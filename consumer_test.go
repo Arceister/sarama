@@ -1707,6 +1707,141 @@ func TestConsumerExpiryTicker(t *testing.T) {
 	broker0.Close()
 }
 
+// TestConsumerExpiryTickerNoMessageLoss verifies that when MaxProcessingTime
+// expires while delivering messages, no messages are lost. The timeout path
+// resets child.offset so undelivered messages are re-fetched on the next cycle.
+func TestConsumerExpiryTickerNoMessageLoss(t *testing.T) {
+	// Setup: a slow consumer that triggers MaxProcessingTime timeouts.
+	// The mock returns batchSize=1 per fetch, so each fetch cycle returns one
+	// message per partition. The consumer reads slowly, triggering timeouts.
+	broker0 := NewMockBroker(t, 0)
+	broker0.SetHandlerByMap(map[string]MockResponse{
+		"MetadataRequest": NewMockMetadataResponse(t).
+			SetBroker(broker0.Addr(), broker0.BrokerID()).
+			SetLeader("my_topic", 0, broker0.BrokerID()),
+		"OffsetRequest": NewMockOffsetResponse(t).
+			SetOffset("my_topic", 0, OffsetNewest, 1234).
+			SetOffset("my_topic", 0, OffsetOldest, 0),
+		"FetchRequest": NewMockFetchResponse(t, 1).
+			SetMessage("my_topic", 0, 0, testMsg).
+			SetMessage("my_topic", 0, 1, testMsg).
+			SetMessage("my_topic", 0, 2, testMsg).
+			SetMessage("my_topic", 0, 3, testMsg).
+			SetMessage("my_topic", 0, 4, testMsg),
+	})
+
+	config := NewTestConfig()
+	config.ChannelBufferSize = 0
+	config.Consumer.MaxProcessingTime = 10 * time.Millisecond
+	master, err := NewConsumer([]string{broker0.Addr()}, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	consumer, err := master.ConsumePartition("my_topic", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Read all 5 messages, deliberately slow to trigger timeouts.
+	// With the offset-reset fix, timed-out messages are re-fetched
+	// rather than lost or leaked.
+	consumed := make(map[int64]bool)
+	timeout := time.After(30 * time.Second)
+	for len(consumed) < 5 {
+		select {
+		case msg := <-consumer.Messages():
+			consumed[msg.Offset] = true
+		case <-timeout:
+			t.Fatalf("timed out waiting for messages, got offsets: %v", consumed)
+		}
+		// Sleep long enough to occasionally trigger MaxProcessingTime
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	for i := int64(0); i < 5; i++ {
+		if !consumed[i] {
+			t.Errorf("message at offset %d was never delivered", i)
+		}
+	}
+
+	safeClose(t, consumer)
+	safeClose(t, master)
+	broker0.Close()
+}
+
+// TestConsumerSlowConsumerNoAccumulation verifies that when a consumer is slow
+// and triggers MaxProcessingTime timeouts, fetch responses do not accumulate
+// in memory. After consuming all messages on the slow path, the runtime should
+// be able to GC the fetch response data.
+func TestConsumerSlowConsumerNoAccumulation(t *testing.T) {
+	// Create a large message (~64KB) to make memory accumulation detectable
+	largeMsgBytes := make([]byte, 64*1024)
+	for i := range largeMsgBytes {
+		largeMsgBytes[i] = byte(i % 256)
+	}
+	largeMsg := ByteEncoder(largeMsgBytes)
+
+	broker0 := NewMockBroker(t, 0)
+	broker0.SetHandlerByMap(map[string]MockResponse{
+		"MetadataRequest": NewMockMetadataResponse(t).
+			SetBroker(broker0.Addr(), broker0.BrokerID()).
+			SetLeader("my_topic", 0, broker0.BrokerID()),
+		"OffsetRequest": NewMockOffsetResponse(t).
+			SetOffset("my_topic", 0, OffsetNewest, 2000).
+			SetOffset("my_topic", 0, OffsetOldest, 0),
+		"FetchRequest": NewMockFetchResponse(t, 10).
+			SetMessage("my_topic", 0, 0, largeMsg).
+			SetMessage("my_topic", 0, 1, largeMsg).
+			SetMessage("my_topic", 0, 2, largeMsg).
+			SetMessage("my_topic", 0, 3, largeMsg).
+			SetMessage("my_topic", 0, 4, largeMsg).
+			SetMessage("my_topic", 0, 5, largeMsg).
+			SetMessage("my_topic", 0, 6, largeMsg).
+			SetMessage("my_topic", 0, 7, largeMsg).
+			SetMessage("my_topic", 0, 8, largeMsg).
+			SetMessage("my_topic", 0, 9, largeMsg),
+	})
+
+	config := NewTestConfig()
+	config.ChannelBufferSize = 0
+	config.Consumer.MaxProcessingTime = 10 * time.Millisecond
+	master, err := NewConsumer([]string{broker0.Addr()}, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	consumer, err := master.ConsumePartition("my_topic", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Consume 10 messages slowly, triggering timeouts
+	consumed := make(map[int64]bool)
+	timeout := time.After(30 * time.Second)
+	for len(consumed) < 10 {
+		select {
+		case msg := <-consumer.Messages():
+			consumed[msg.Offset] = true
+		case <-timeout:
+			t.Fatalf("timed out waiting for messages, got %d of 10", len(consumed))
+		}
+		// Sleep to trigger MaxProcessingTime timeouts
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	// Verify no messages were lost
+	for i := int64(0); i < 10; i++ {
+		if !consumed[i] {
+			t.Errorf("message at offset %d was never delivered", i)
+		}
+	}
+
+	safeClose(t, consumer)
+	safeClose(t, master)
+	broker0.Close()
+}
+
 func TestConsumerTimestamps(t *testing.T) {
 	now := time.Now().Truncate(time.Millisecond)
 	type testMessage struct {

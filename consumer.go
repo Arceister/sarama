@@ -677,16 +677,13 @@ feederLoop:
 			case <-expiryTicker.C:
 				if !firstAttempt {
 					child.responseResult = errTimedOut
+					// Reset offset to the first undelivered message so it will
+					// be re-fetched on the next cycle. This avoids pushing
+					// remaining messages without backpressure which caused
+					// unbounded memory growth (fetch responses piling up faster
+					// than the application could consume them).
+					child.offset = msgs[i].Offset
 					broker.acks.Done()
-				remainingLoop:
-					for _, msg = range msgs[i:] {
-						child.interceptors(msg)
-						select {
-						case child.messages <- msg:
-						case <-child.dying:
-							break remainingLoop
-						}
-					}
 					if !broker.queueSubscription(child) {
 						child.triggerRedispatch()
 					}
